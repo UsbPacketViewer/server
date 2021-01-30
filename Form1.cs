@@ -294,7 +294,7 @@ namespace usbpv_server_demo_cs
 
             }
             if (hasData) {
-                if (len > 9)
+                if (len >= 9)
                 {
                     UInt32 ts = GetUint32(data, 0);
                     UInt32 nano = GetUint32(data, 4);
