@@ -1,6 +1,6 @@
 # USB Packet Viewer Server Demo
 
-Demo code to communicate with USB Packet Viewer server mode.
+Demo code to communicate with USB Packet Viewer server mode, Written in C#.
 
-与USB Packet Viewer服务端模式通讯的示例代码。
+C#编写的与USB Packet Viewer服务端模式通讯的示例代码。
 
