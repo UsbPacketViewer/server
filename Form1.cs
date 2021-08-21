@@ -245,8 +245,37 @@ namespace usbpv_server_demo_cs
             return (UInt32)(data[0+pos] | (data[1+pos] << 8) | (data[2+pos] << 16) | (data[3+pos]<<24));
         }
 
-        private void OnCommand(byte cmd, byte[] data, int len)
+        System.IO.StreamWriter logger = null;
+
+        const String hex = "0123456789ABCDEF";
+        String toHex(byte[] data, int len) {
+            if (len <= 0) len = data.Length;
+            StringBuilder sb = new StringBuilder(len * 2);
+            for (int i = 0; i < len; i++) {
+                sb.Append(hex[data[i]>>4]);
+                sb.Append(hex[data[i]&0x0f]);
+            }
+            return sb.ToString();
+        }
+        byte[] fromHex(String hex) {
+            byte[] res = new byte[hex.Length / 2];
+            for (int i = 0; i < hex.Length; i+=2) {
+                res[i/2] = Convert.ToByte(hex.Substring(i, 2), 16);
+            }
+            return res;
+        }
+
+        private Int64 pkt_count = 0;
+
+        private void OnCommand(byte cmd, byte[] data, int len, bool log = true)
         {
+            if (logger != null && log)
+            {
+                logger.Write((char)cmd);
+                logger.Write(toHex(data, len));
+                logger.WriteLine();
+                logger.Flush();
+            }
             string speed = "unknown";
             bool hasData = false;
             switch (cmd) {
@@ -296,9 +325,13 @@ namespace usbpv_server_demo_cs
             if (hasData) {
                 if (len >= 9)
                 {
+                    pkt_count++;
+                    if (fwData(data, len)) {
+                        return;
+                    }
                     UInt32 ts = GetUint32(data, 0);
                     UInt32 nano = GetUint32(data, 4);
-                    LogInOtherThread("Got " + speed + " data " + ts + "." + nano + " data len " + (len - 8) + " PID " + (data[8] & 0x0f));
+                    //LogInOtherThread("Got " + speed + " data " + ts + "." + nano + " data len " + (len - 8) + " PID " + (data[8] & 0x0f));
                 }
                 else {
                     LogInOtherThread("Wrong data len " + len);
@@ -312,6 +345,26 @@ namespace usbpv_server_demo_cs
         private void btnOpenDevice_Click(object sender, EventArgs e)
         {
             byte[] sn = System.Text.Encoding.ASCII.GetBytes(textSN.Text);
+            if (sn.Length == 0) {
+                OpenFileDialog dlg = new OpenFileDialog();
+                dlg.Title = "Replay a log file";
+                dlg.Filter = "Log file|*.log";
+                if (dlg.ShowDialog() == DialogResult.OK) {
+                    System.IO.StreamReader reader = new System.IO.StreamReader(dlg.FileName);
+                    int line_count = 0;
+                    do {
+                        String ln = reader.ReadLine();
+                        if (ln.Length > 10) {
+                            byte cmd = (byte)ln[0];
+                            byte[] cmd_data = fromHex(ln.Substring(1));
+                            OnCommand(cmd, cmd_data, cmd_data.Length, false);
+                        }
+                        line_count++;
+                    } while (!reader.EndOfStream);
+                    Log("Load "+line_count+" lines data");
+                    return;
+                }
+            }
             byte[] data = new byte[4 + sn.Length + 2];
             data[0] = CMD_START_FLAG;
             data[1] = CMD_OPEN;
@@ -330,10 +383,19 @@ namespace usbpv_server_demo_cs
             data[5 + sn.Length] = speed;
 
             SendCommand(data, data.Length);
+            pkt_count = 0;
+            if (logger == null)
+            {
+                logger = new System.IO.StreamWriter("upv_client_demo.log");
+                Log("Received data will store in upv_client_demo.log");
+            }
+            countTimer.Start();
         }
+
         private void btnCloseDevice_Click(object sender, EventArgs e)
         {
             SendCommand(new byte[] { CMD_START_FLAG, CMD_CLOSE, 0, 0 }, 4);
+            countTimer.Stop();
         }
         private void btnClearLog_Click(object sender, EventArgs e)
         {
@@ -374,9 +436,229 @@ namespace usbpv_server_demo_cs
                 m_tcpClient.BeginConnect(
                     IPAddress.Parse(textIP.Text),
                     Int32.Parse(textPort.Text),
-                    TcpAsyncConnect, this);
+                    TcpAsyncConnect, null);
                 btnConnect.Enabled = false;
             }
+        }
+
+
+
+        private TcpClient m_fwTcpClient = new TcpClient();
+        private UdpClient m_fwUdpClient = null;
+        private byte[] m_fwReadBuffer = new byte[RECV_BUFF_LEN];
+        private bool m_fwTcpMode = false;
+
+        private void fwAsyncRead(IAsyncResult resRead){
+            try
+            {
+                int len = m_fwTcpClient.GetStream().EndRead(resRead);
+                //LogInOtherThread("FWTCP Got " + len + " bytes data");
+                if (len <= 0)
+                {
+                    m_fwTcpClient.Close();
+                    FwTcpConnectionChanged(false);
+                }
+                else
+                {
+                    m_fwTcpClient.GetStream().BeginRead(m_fwReadBuffer, 0, RECV_BUFF_LEN, fwAsyncRead, null);
+                }
+            }
+            catch (Exception e2)
+            {
+                m_uiContext.Post((obj) =>
+                {
+                    LogInOtherThread("Read fail. Connection loss" + e2.ToString());
+                    FwTcpConnectionChanged(false);
+                }, null);
+            }
+        }
+        private void FwTcpConnectionChanged(bool isConnected)
+        {
+            if (isConnected)
+            {
+                btnFWTcp.Text = "Stop TCP";
+            }
+            else
+            {
+                btnFWTcp.Text = "Start TCP";
+                btnFWUdp.Enabled = true;
+            }
+            btnFWTcp.Enabled = true;
+        }
+        private void FwTcpAsyncConnect(IAsyncResult res)
+        {
+            try
+            {
+                m_fwTcpClient.EndConnect(res);
+                m_uiContext.Post((obj) =>
+                {
+                    Log("FW Connect success");
+                    FwTcpConnectionChanged(true);
+                }, null);
+                m_fwTcpClient.GetStream().BeginRead(m_fwReadBuffer, 0, RECV_BUFF_LEN, fwAsyncRead, null);
+
+                return;
+            }
+            catch (Exception e)
+            {
+                m_uiContext.Post((obj) =>
+                {
+                    Log("FW Connect fail. " + e.ToString());
+                    FwTcpConnectionChanged(false);
+                }, null);
+
+            }
+        }
+        private void btnFWTcp_Click(object sender, EventArgs e)
+        {
+            btnFWUdp.Enabled = false;
+            if (m_fwTcpClient.Connected)
+            {
+                m_fwTcpClient.Close();
+                FwTcpConnectionChanged(false);
+                btnFWUdp.Enabled = true;
+                m_fwTcpMode = false;
+            }
+            else
+            {
+                m_fwTcpMode = true;
+                m_fwTcpClient = new TcpClient();
+                m_fwTcpClient.BeginConnect(
+                    IPAddress.Parse(textFWIP.Text),
+                    Int32.Parse(textFWPort.Text), FwTcpAsyncConnect, null);
+                btnFWTcp.Enabled = false;
+
+                mFwEp = Int32.Parse(textFWEP.Text);
+                mFwPid = 0;
+                switch (comboEpType.SelectedIndex)
+                {
+                    case 1: mFwPid = PID_IN; break;
+                    case 2: mFwPid = PID_OUT; break;
+                }
+
+            }
+        }
+        private void FWUdpAsyncReadDone(IAsyncResult res)
+        {
+            if (m_udpClient != null)
+            {
+                try
+                {
+                    IPEndPoint ep = new IPEndPoint(0, 0);
+                    byte[] data = m_fwUdpClient.EndReceive(res, ref ep);
+                    //LogInOtherThread("UDP fw got " + data.Length + " bytes data");
+                    m_fwUdpClient.BeginReceive(FWUdpAsyncReadDone, null);
+                }
+                catch (Exception e)
+                {
+                }
+            }
+        }
+        private void btnFWUdp_Click(object sender, EventArgs e)
+        {
+            if (m_fwUdpClient == null)
+            {
+                m_fwUdpClient = new UdpClient();
+                m_fwUdpClient.Connect(textFWIP.Text, int.Parse(textFWPort.Text));
+                btnFWUdp.Text = "Stop UDP";
+                btnFWTcp.Enabled = false;
+                m_fwUdpClient.BeginReceive(FWUdpAsyncReadDone, null);
+                mFwEp = Int32.Parse(textFWEP.Text);
+                mFwPid = 0;
+                switch (comboEpType.SelectedIndex)
+                {
+                    case 1: mFwPid = PID_IN; break;
+                    case 2: mFwPid = PID_OUT; break;
+                }
+            }
+            else
+            {
+                m_fwUdpClient.Close();
+                m_fwUdpClient = null;
+                btnFWUdp.Text = "Start UDP";
+                btnFWTcp.Enabled = true;
+            }
+        }
+        private static int PID_IN = 0x69;
+        private static int PID_OUT = 0xe1;
+        private static int PID_DATA0 = 0xC3;
+        private static int PID_DATA1 = 0x4b;
+        private bool fwWaitData = false;
+        private int mFwEp = -1;
+        private int mFwPid = 0;
+        private bool fwData(byte[] data, int len) {
+            if (m_fwUdpClient == null && (!m_fwTcpClient.Connected))
+            {
+                return false;
+            }
+            if (len < 11) {
+                return true;
+            }
+            if (fwWaitData) {
+                if (data[8] == PID_DATA0 || data[8] == PID_DATA1) {
+                    if (len > 3) {
+                        fwPureData(data, 1, len-3);
+                    }
+                    fwWaitData = false;
+                }
+                return true;
+            }
+            if (data[8] != PID_IN && data[8] != PID_OUT) {
+                return true;
+            }
+            
+            if (mFwPid != 0) {
+                if (data[9] != mFwPid) {
+                    return true;
+                }
+            }
+            int tEp = ((data[9] >> 7) & 0x01) | ((data[10]<<1) &0x0e);
+            if (mFwEp >= 0)
+            {
+                if (tEp == mFwEp)
+                {
+                    fwWaitData = true;
+                }
+            }
+            else {
+                fwWaitData = true;
+            }
+            //LogInOtherThread("got In/Out " + String.Format("{0:x2} ", data[9]) + String.Format("{0:x2}", mFwPid)+ "  " + fwWaitData + " " + tEp);
+            return true;
+        }
+
+        private void fwPureData(byte[] data, int offset, int len)
+        {
+            if (m_fwUdpClient != null)
+            {
+                byte[] buff = new byte[len];
+                for (int i = 0; i < len; i++)
+                {
+                    buff[i] = data[i + offset];
+                }
+                m_fwUdpClient.Send(buff, len);
+            }
+            if (m_fwTcpClient.Connected)
+            {
+                m_fwTcpClient.GetStream().BeginWrite(data, offset, len, (IAsyncResult res) => {
+                    try
+                    {
+                        m_fwTcpClient.GetStream().EndWrite(res);
+                    }
+                    catch (Exception e)
+                    {
+                        m_uiContext.Post((obj) =>
+                        {
+                            Log("Write fail. " + e.ToString());
+                        }, null);
+                    }
+                }, null);
+            }
+        }
+
+        private void countTimer_Tick(object sender, EventArgs e)
+        {
+            Log("Got " + pkt_count + " packets");
         }
     }
 }
